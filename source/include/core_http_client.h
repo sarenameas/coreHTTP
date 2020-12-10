@@ -464,7 +464,7 @@ typedef struct HTTPResponse
      * If this function is set, then the maximum elapsed time between network
      * sends greater than zero is set in HTTP_SEND_RETRY_TIMEOUT_MS.
      */
-    HTTPClient_GetCurrentTimeFunc_t * pGetTimeFunction;
+    HTTPClient_GetCurrentTimeFunc_t getTime;
 
     /**
      * @brief The starting location of the response headers in pBuffer.

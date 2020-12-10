@@ -316,6 +316,8 @@ static int findHeaderOnHeaderCompleteCallback( http_parser * pHttpParser );
  * server.
  *
  * @param[in] pParsingContext The parsing context to initialize.
+ * @param[in] isHeadResponse If the response expected is for a HEAD request this
+ * is set to 1, otherwise this is set to 0.
  */
 static void initializeParsingContextForFirstResponse( HTTPParsingContext_t * pParsingContext );
 
@@ -329,8 +331,6 @@ static void initializeParsingContextForFirstResponse( HTTPParsingContext_t * pPa
  * @param[in,out] pParsingContext The response parsing state.
  * @param[in,out] pResponse The response information to be updated.
  * @param[in] parseLen The next length to parse in pResponse->pBuffer.
- * @param[in] isHeadResponse If the response is to a HEAD request this is set
- * to 1, otherwise this is set to 0.
  *
  * @return One of the following:
  * - #HTTPSuccess
@@ -339,8 +339,7 @@ static void initializeParsingContextForFirstResponse( HTTPParsingContext_t * pPa
  */
 static HTTPStatus_t parseHttpResponse( HTTPParsingContext_t * pParsingContext,
                                        HTTPResponse_t * pResponse,
-                                       size_t parseLen,
-                                       uint8_t isHeadResponse );
+                                       size_t parseLen );
 
 /**
  * @brief Callback invoked during http_parser_execute() to indicate the start of
@@ -926,13 +925,16 @@ static int httpParserOnMessageCompleteCallback( http_parser * pHttpParser )
 
 /*-----------------------------------------------------------*/
 
-static void initializeParsingContextForFirstResponse( HTTPParsingContext_t * pParsingContext )
+static void initializeParsingContextForFirstResponse( HTTPParsingContext_t * pParsingContext,
+                                                      uint8_t isHeadResponse )
 {
     assert( pParsingContext != NULL );
+    assert( isHeadResponse <= 1U );
 
     /* Initialize the third-party HTTP parser to parse responses. */
     http_parser_init( &( pParsingContext->httpParser ), HTTP_RESPONSE );
 
+    /* The parser will return an error if this header size limit is exceeded. */
     http_parser_set_max_header_size( HTTP_MAX_RESPONSE_HEADERS_SIZE_BYTES );
 
     /* No response has been parsed yet. */
@@ -940,6 +942,9 @@ static void initializeParsingContextForFirstResponse( HTTPParsingContext_t * pPa
 
     /* No response to update is associated with this parsing context yet. */
     pParsingContext->pResponse = NULL;
+
+    /* Set that this parsing context expects a HEAD response. */
+    pParsingContext->isHeadResponse = isHeadResponse;
 }
 
 /*-----------------------------------------------------------*/
@@ -1060,8 +1065,7 @@ static HTTPStatus_t processHttpParserError( const http_parser * pHttpParser )
 
 static HTTPStatus_t parseHttpResponse( HTTPParsingContext_t * pParsingContext,
                                        HTTPResponse_t * pResponse,
-                                       size_t parseLen,
-                                       uint8_t isHeadResponse )
+                                       size_t parseLen )
 {
     HTTPStatus_t returnStatus;
     http_parser_settings parserSettings = { 0 };
@@ -1073,7 +1077,6 @@ static HTTPStatus_t parseHttpResponse( HTTPParsingContext_t * pParsingContext,
 
     assert( pParsingContext != NULL );
     assert( pResponse != NULL );
-    assert( isHeadResponse <= 1 );
 
     /* If this is the first time this parsing context is used, then set the
      * response input. */
@@ -1081,8 +1084,6 @@ static HTTPStatus_t parseHttpResponse( HTTPParsingContext_t * pParsingContext,
     {
         pParsingContext->pResponse = pResponse;
         pParsingContext->pBufferCur = ( const char * ) pResponse->pBuffer;
-        /* Set if this response is for a HEAD request. */
-        pParsingContext->isHeadResponse = isHeadResponse;
 
         /* Initialize the status-code returned in the response. */
         pResponse->statusCode = 0U;
@@ -1849,6 +1850,7 @@ static HTTPStatus_t sendHttpBody( const TransportInterface_t * pTransport,
 /*-----------------------------------------------------------*/
 
 static HTTPStatus_t receiveHttpData( const TransportInterface_t * pTransport,
+                                     HTTPParsingContext_t parsingContext,
                                      uint8_t * pBuffer,
                                      size_t bufferLen,
                                      size_t * pBytesReceived )
@@ -1860,6 +1862,9 @@ static HTTPStatus_t receiveHttpData( const TransportInterface_t * pTransport,
     assert( pTransport->recv != NULL );
     assert( pBuffer != NULL );
     assert( pBytesReceived != NULL );
+
+    /* Initialize the bytes received. */
+    *pBytesReceived = 0;
 
     transportStatus = pTransport->recv( pTransport->pNetworkContext,
                                         pBuffer,
@@ -1888,11 +1893,9 @@ static HTTPStatus_t receiveHttpData( const TransportInterface_t * pTransport,
     }
     else
     {
-        /* When a zero is returned from the transport recv it will not be
-         * invoked again. */
-        *pBytesReceived = 0U;
-        LogDebug( ( "Received zero bytes from transport recv(). Receiving "
-                    "transport data is complete." ) );
+        /* Zero bytes indicates a no data available condition from the 
+         * transport receive. */
+        LogDebug( ( "Received zero bytes from transport recv()." ) );
     }
 
     return returnStatus;
@@ -1947,6 +1950,7 @@ static HTTPStatus_t getFinalResponseStatus( HTTPParsingState_t parsingState,
 
 /*-----------------------------------------------------------*/
 
+#if 0
 static HTTPStatus_t receiveAndParseHttpResponse( const TransportInterface_t * pTransport,
                                                  HTTPResponse_t * pResponse,
                                                  const HTTPRequestHeaders_t * pRequestHeaders )
@@ -1957,6 +1961,8 @@ static HTTPStatus_t receiveAndParseHttpResponse( const TransportInterface_t * pT
     HTTPParsingContext_t parsingContext = { 0 };
     uint8_t shouldRecv = 1U;
     uint8_t isHeadResponse = 0U;
+    uint32_t lastDataRecvTimeMs = 0U, timeSinceLastRecvMs = 0U;
+    uint8_t shouldParse = 1U;
 
     assert( pTransport != NULL );
     assert( pTransport->recv != NULL );
@@ -1977,7 +1983,11 @@ static HTTPStatus_t receiveAndParseHttpResponse( const TransportInterface_t * pT
 
     /* Initialize the parsing context for parsing the response received from the
      * network. */
-    initializeParsingContextForFirstResponse( &parsingContext );
+    initializeParsingContextForFirstResponse( &parsingContext, isHeadResponse );
+
+    /* The response is attempted to be recieved right after sending the request.
+     * We therefore keep track of the start time when waiting for a response. */
+    lastDataRecvTimeMs = pResponse->getTime();
 
     while( shouldRecv == 1U )
     {
@@ -1989,22 +1999,44 @@ static HTTPStatus_t receiveAndParseHttpResponse( const TransportInterface_t * pT
 
         if( returnStatus == HTTPSuccess )
         {
-            /* Data is received into the buffer and must be parsed. Parsing is
-             * invoked even with a length of zero. A length of zero indicates to
-             * the parser that there is no more data from the server (EOF). */
-            returnStatus = parseHttpResponse( &parsingContext,
-                                              pResponse,
-                                              currentReceived,
-                                              isHeadResponse );
+            if( currentReceived > 0 )
+            {
+                /* Reset the time of the last data received when data is received. */
+                lastDataRecvTimeMs = pResponse->getTime();
+                /* Parsing is done on data as soon as it is received from the network.
+                 * Because we cannot know how large the HTTP response will be in
+                 * total, we could have received the entire response in the first
+                 * call to the transport receive. */
+                shouldParse = 1U;
+            }
+            else
+            {
+                timeSinceLastRecvMs = getTimeStampMs() - lastDataRecvTimeMs;
+                shouldParse = 0U;
+                /* Check of the allowed elapsed time has been reached. */
+                if( timeSinceLastRecvMs >= HTTP_RECV_RETRY_TIMEOUT_MS )
+                {
+                    /* Invoke the parsing even with the a length of zero to indicate
+                     * to the parser that there is no more data available from
+                     * the server. */
+                    shouldParse = 1U;
+                    returnStatus = HTTPNetworkError;
+                }
+            }
+
+            if( shouldParse == 1U )
+            {
+                returnStatus = parseHttpResponse( &parsingContext,
+                                                  pResponse,
+                                                  currentReceived );
+            }
             totalReceived += currentReceived;
         }
 
         /* Reading should continue if there are no errors in the transport recv
-         * or parsing, non-zero data was received from the network,
-         * the parser indicated the response message is not finished, and there
-         * is room in the response buffer. */
+         * or parsing, the parser indicated the response message is not finished,
+         * and there is room in the response buffer. */
         shouldRecv = ( ( returnStatus == HTTPSuccess ) &&
-                       ( currentReceived > 0U ) &&
                        ( parsingContext.state != HTTP_PARSING_COMPLETE ) &&
                        ( totalReceived < pResponse->bufferLen ) ) ? 1U : 0U;
     }
@@ -2021,6 +2053,116 @@ static HTTPStatus_t receiveAndParseHttpResponse( const TransportInterface_t * pT
 
     return returnStatus;
 }
+#endif
+
+static HTTPStatus_t receiveAndParseHttpResponse( const TransportInterface_t * pTransport,
+                                                 HTTPResponse_t * pResponse,
+                                                 const HTTPRequestHeaders_t * pRequestHeaders )
+{
+    HTTPStatus_t returnStatus = HTTPSuccess;
+    size_t totalReceived = 0U;
+    int32_t currentReceived = 0U;
+    HTTPParsingContext_t parsingContext = { 0 };
+    uint8_t shouldRecv = 1U;
+    uint8_t shouldParse = 1U;
+    uint8_t isHeadResponse = 0U;
+    uint32_t lastDataRecvTimeMs = 0U, timeSinceLastRecvMs = 0U;
+
+    assert( pTransport != NULL );
+    assert( pTransport->recv != NULL );
+    assert( pResponse != NULL );
+    assert( pRequestHeaders != NULL );
+    assert( pRequestHeaders->headersLen >= HTTP_MINIMUM_REQUEST_LINE_LENGTH );
+
+    /* The parsing context needs to know if the response is for a HEAD request.
+     * The third-party parser requires parsing is manually indicated to stop
+     * in the httpParserOnHeadersCompleteCallback() for a HEAD response,
+     * otherwise the parser will not indicate the message was complete. */
+    if( strncmp( ( const char * ) ( pRequestHeaders->pBuffer ),
+                 HTTP_METHOD_HEAD,
+                 sizeof( HTTP_METHOD_HEAD ) - 1U ) == 0 )
+    {
+        isHeadResponse = 1U;
+    }
+
+    /* Initialize the parsing context for parsing the response received from the
+     * network. */
+    initializeParsingContextForFirstResponse( &parsingContext, isHeadResponse );
+
+    while( shouldRecv == 1U )
+    {
+        /* Receive the HTTP response data into the pResponse->pBuffer. */
+        currentReceived = pTransport->recv( pTransport->pNetworkContext,
+                                            pResponse->pBuffer + totalReceived,
+                                            pResponse->bufferLen - totalReceived );
+
+        if( currentReceived < 0 )
+        {
+            LogError( ( "Failed to receive HTTP data: Transport recv() "
+                        "returned error: TransportStatus=%ld",
+                        ( long int ) transportStatus ) );
+            returnStatus = HTTPNetworkError;
+        }
+        else if( currentReceived > 0 )
+        {
+            /* Reset the time of the last data received when data is received. */
+            lastDataRecvTimeMs = pResponse->getTime();
+            /* Parsing is done on data as soon as it is received from the network.
+             * Because we cannot know how large the HTTP response will be in
+             * total, parsing will tell us if the end of the message is reached.*/
+            shouldParse = 1U;
+            totalReceived += currentReceived;
+        }
+        else
+        {
+            timeSinceLastRecvMs = getTimeStampMs() - lastDataRecvTimeMs;
+
+            /* Check of the allowed elapsed time has been reached. */
+            if( timeSinceLastRecvMs >= HTTP_RECV_RETRY_TIMEOUT_MS )
+            {
+                /* Invoke the parsing upon this final zero data to indicate
+                 * to the parser that there is no more data available from the
+                 * server. */
+                shouldParse = 1U;
+            }
+            else
+            {
+                /* Do not invoke the response parsing for this zero data. */
+                shouldParse = 0U;
+            }
+        }
+
+        if( shouldParse == 1U )
+        {
+            /* Data is received into the buffer and must be parsed. Parsing is
+             * invoked even with a length of zero. A length of zero indicates to
+             * the parser that there is no more data from the server (EOF). */
+            returnStatus = parseHttpResponse( &parsingContext,
+                                              pResponse,
+                                              currentReceived );
+        }
+
+        /* Reading should continue if there are no errors in the transport recv
+         * or parsing, the parser indicated the response message is not finished,
+         * and there is room in the response buffer. */
+        shouldRecv = ( ( returnStatus == HTTPSuccess ) &&
+                       ( parsingContext.state != HTTP_PARSING_COMPLETE ) &&
+                       ( totalReceived < pResponse->bufferLen ) ) ? 1U : 0U;
+    }
+
+    if( returnStatus == HTTPSuccess )
+    {
+        /* If there are errors in receiving from the network or during parsing,
+         * the final status of the response message is derived from the state of
+         * the parsing and how much data is in the buffer. */
+        returnStatus = getFinalResponseStatus( parsingContext.state,
+                                               totalReceived,
+                                               pResponse->bufferLen );
+    }
+
+    return returnStatus;
+}
+
 
 /*-----------------------------------------------------------*/
 
