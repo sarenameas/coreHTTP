@@ -1850,53 +1850,87 @@ static HTTPStatus_t sendHttpBody( const TransportInterface_t * pTransport,
 /*-----------------------------------------------------------*/
 
 static HTTPStatus_t receiveHttpData( const TransportInterface_t * pTransport,
-                                     HTTPParsingContext_t parsingContext,
-                                     uint8_t * pBuffer,
-                                     size_t bufferLen,
-                                     size_t * pBytesReceived )
+                                     HTTPParsingContext_t* pParsingContext,
+                                     HTTPResponse_t * pResponse,
+                                     size_t * pTotalReceived )
 {
     HTTPStatus_t returnStatus = HTTPSuccess;
-    int32_t transportStatus = 0;
+    int32_t currentReceived = 0U;
+    size_t totalReceived = 0U;
+    uint8_t shouldRecv = 1U;
+    uint8_t shouldParse = 1U;
+    uint32_t lastDataRecvTimeMs = 0U, timeSinceLastRecvMs = 0U;
 
     assert( pTransport != NULL );
     assert( pTransport->recv != NULL );
-    assert( pBuffer != NULL );
-    assert( pBytesReceived != NULL );
+    assert( pResponse != NULL );
+    assert( pResponse->pBuffer != NULL );
+    assert( pTotalReceived != NULL );
 
-    /* Initialize the bytes received. */
-    *pBytesReceived = 0;
+    lastDataRecvTimeMs = pResponse->getTime();
 
-    transportStatus = pTransport->recv( pTransport->pNetworkContext,
-                                        pBuffer,
-                                        bufferLen );
-
-    /* A transport status of less than zero is an error. */
-    if( transportStatus < 0 )
+    while( shouldRecv == 1U )
     {
-        LogError( ( "Failed to receive HTTP data: Transport recv() "
-                    "returned error: TransportStatus=%ld",
-                    ( long int ) transportStatus ) );
-        returnStatus = HTTPNetworkError;
-    }
-    else if( transportStatus > 0 )
-    {
-        /* It is a bug in the application's transport receive implementation if
-         * more bytes than expected are received. To avoid a possible overflow
-         * in converting bytesRemaining from unsigned to signed, this assert
-         * must exist after the check for transportStatus being negative. */
-        assert( ( size_t ) transportStatus <= bufferLen );
+        /* Receive the HTTP response data into the pResponse->pBuffer. */
+        currentReceived = pTransport->recv( pTransport->pNetworkContext,
+                                            pResponse->pBuffer + totalReceived,
+                                            pResponse->bufferLen - totalReceived );
 
-        /* Some or all of the specified data was received. */
-        *pBytesReceived = ( size_t ) ( transportStatus );
-        LogDebug( ( "Received data from the transport: BytesReceived=%ld",
-                    ( long int ) transportStatus ) );
+        if( currentReceived < 0 )
+        {
+            LogError( ( "Failed to receive HTTP data: Transport recv() "
+                        "returned error: TransportStatus=%ld",
+                        ( long int ) transportStatus ) );
+            returnStatus = HTTPNetworkError;
+        }
+        else if( currentReceived > 0 )
+        {
+            /* Reset the time of the last data received when data is received. */
+            lastDataRecvTimeMs = pResponse->getTime();
+            /* Parsing is done on data as soon as it is received from the network.
+             * Because we cannot know how large the HTTP response will be in
+             * total, parsing will tell us if the end of the message is reached.*/
+            shouldParse = 1U;
+            totalReceived += currentReceived;
+        }
+        else
+        {
+            timeSinceLastRecvMs = getTimeStampMs() - lastDataRecvTimeMs;
+
+            /* Check of the allowed elapsed time has been reached. */
+            if( timeSinceLastRecvMs >= HTTP_RECV_RETRY_TIMEOUT_MS )
+            {
+                /* Invoke the parsing upon this final zero data to indicate
+                 * to the parser that there is no more data available from the
+                 * server. */
+                shouldParse = 1U;
+            }
+            else
+            {
+                /* Do not invoke the response parsing for this zero data. */
+                shouldParse = 0U;
+            }
+        }
+
+        if( shouldParse == 1U )
+        {
+            /* Data is received into the buffer and must be parsed. Parsing is
+             * invoked even with a length of zero. A length of zero indicates to
+             * the parser that there is no more data from the server (EOF). */
+            returnStatus = parseHttpResponse( pParsingContext,
+                                              pResponse,
+                                              currentReceived );
+        }
+
+        /* Reading should continue if there are no errors in the transport recv
+         * or parsing, the parser indicated the response message is not finished,
+         * and there is room in the response buffer. */
+        shouldRecv = ( ( returnStatus == HTTPSuccess ) &&
+                       ( pParsingContext->state != HTTP_PARSING_COMPLETE ) &&
+                       ( totalReceived < pResponse->bufferLen ) ) ? 1U : 0U;
     }
-    else
-    {
-        /* Zero bytes indicates a no data available condition from the 
-         * transport receive. */
-        LogDebug( ( "Received zero bytes from transport recv()." ) );
-    }
+
+    *pTotalReceived = totalReceived;
 
     return returnStatus;
 }
@@ -2060,13 +2094,10 @@ static HTTPStatus_t receiveAndParseHttpResponse( const TransportInterface_t * pT
                                                  const HTTPRequestHeaders_t * pRequestHeaders )
 {
     HTTPStatus_t returnStatus = HTTPSuccess;
-    size_t totalReceived = 0U;
-    int32_t currentReceived = 0U;
+    
     HTTPParsingContext_t parsingContext = { 0 };
-    uint8_t shouldRecv = 1U;
-    uint8_t shouldParse = 1U;
     uint8_t isHeadResponse = 0U;
-    uint32_t lastDataRecvTimeMs = 0U, timeSinceLastRecvMs = 0U;
+    size_t totalReceived = 0U;
 
     assert( pTransport != NULL );
     assert( pTransport->recv != NULL );
@@ -2089,66 +2120,8 @@ static HTTPStatus_t receiveAndParseHttpResponse( const TransportInterface_t * pT
      * network. */
     initializeParsingContextForFirstResponse( &parsingContext, isHeadResponse );
 
-    while( shouldRecv == 1U )
-    {
-        /* Receive the HTTP response data into the pResponse->pBuffer. */
-        currentReceived = pTransport->recv( pTransport->pNetworkContext,
-                                            pResponse->pBuffer + totalReceived,
-                                            pResponse->bufferLen - totalReceived );
-
-        if( currentReceived < 0 )
-        {
-            LogError( ( "Failed to receive HTTP data: Transport recv() "
-                        "returned error: TransportStatus=%ld",
-                        ( long int ) transportStatus ) );
-            returnStatus = HTTPNetworkError;
-        }
-        else if( currentReceived > 0 )
-        {
-            /* Reset the time of the last data received when data is received. */
-            lastDataRecvTimeMs = pResponse->getTime();
-            /* Parsing is done on data as soon as it is received from the network.
-             * Because we cannot know how large the HTTP response will be in
-             * total, parsing will tell us if the end of the message is reached.*/
-            shouldParse = 1U;
-            totalReceived += currentReceived;
-        }
-        else
-        {
-            timeSinceLastRecvMs = getTimeStampMs() - lastDataRecvTimeMs;
-
-            /* Check of the allowed elapsed time has been reached. */
-            if( timeSinceLastRecvMs >= HTTP_RECV_RETRY_TIMEOUT_MS )
-            {
-                /* Invoke the parsing upon this final zero data to indicate
-                 * to the parser that there is no more data available from the
-                 * server. */
-                shouldParse = 1U;
-            }
-            else
-            {
-                /* Do not invoke the response parsing for this zero data. */
-                shouldParse = 0U;
-            }
-        }
-
-        if( shouldParse == 1U )
-        {
-            /* Data is received into the buffer and must be parsed. Parsing is
-             * invoked even with a length of zero. A length of zero indicates to
-             * the parser that there is no more data from the server (EOF). */
-            returnStatus = parseHttpResponse( &parsingContext,
-                                              pResponse,
-                                              currentReceived );
-        }
-
-        /* Reading should continue if there are no errors in the transport recv
-         * or parsing, the parser indicated the response message is not finished,
-         * and there is room in the response buffer. */
-        shouldRecv = ( ( returnStatus == HTTPSuccess ) &&
-                       ( parsingContext.state != HTTP_PARSING_COMPLETE ) &&
-                       ( totalReceived < pResponse->bufferLen ) ) ? 1U : 0U;
-    }
+    /* Received the HTTP data into the pResponse buffer. */
+    returnStatus = receiveHttpData( pTransport, &parsingContext, pResponse, &totalReceived );
 
     if( returnStatus == HTTPSuccess )
     {
