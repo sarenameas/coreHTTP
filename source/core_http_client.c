@@ -159,15 +159,16 @@ static HTTPStatus_t addRangeHeader( HTTPRequestHeaders_t * pRequestHeaders,
  * @param[in] pBuffer Response buffer.
  * @param[in] bufferLen Length of the response buffer.
  * @param[out] pBytesReceived Bytes received from the transport interface.
+ * @param[in] getTimestampMs Function to get the system time in milliseconds.
  *
- * @return Returns #HTTPSuccess if successful. If there was a network error or
- * more bytes than what was specified were read, then #HTTPNetworkError is
- * returned.
+ * @return Returns #HTTPSuccess if successful. If there was a network error
+ * #HTTPNetworkError is returned.
  */
 static HTTPStatus_t receiveHttpData( const TransportInterface_t * pTransport,
                                      uint8_t * pBuffer,
                                      size_t bufferLen,
-                                     size_t * pBytesReceived );
+                                     size_t * pBytesReceived,
+                                     const HTTPClient_GetCurrentTimeFunc_t getTimestampMs );
 
 /**
  * @brief Get the status of the HTTP response given the parsing state and how
@@ -1851,48 +1852,74 @@ static HTTPStatus_t sendHttpBody( const TransportInterface_t * pTransport,
 static HTTPStatus_t receiveHttpData( const TransportInterface_t * pTransport,
                                      uint8_t * pBuffer,
                                      size_t bufferLen,
-                                     size_t * pBytesReceived )
+                                     size_t * pBytesReceived,
+                                     const HTTPClient_GetCurrentTimeFunc_t getTimestampMs )
 {
     HTTPStatus_t returnStatus = HTTPSuccess;
+    uint8_t shouldReceive = 1;
+    uint8_t * pIndex = NULL;
+    size_t bufferSpaceLeft = 0;
     int32_t transportStatus = 0;
+    uint32_t lastDataRecvTimeMs = 0U, timeSinceLastRecvMs = 0U;
 
     assert( pTransport != NULL );
     assert( pTransport->recv != NULL );
     assert( pBuffer != NULL );
     assert( pBytesReceived != NULL );
+    assert( bufferLen > 0 );
 
-    transportStatus = pTransport->recv( pTransport->pNetworkContext,
-                                        pBuffer,
-                                        bufferLen );
+    *pBytesReceived = 0;
+    pIndex = pBuffer;
+    bufferSpaceLeft = bufferLen;
 
-    /* A transport status of less than zero is an error. */
-    if( transportStatus < 0 )
+    while( ( bufferSpaceLeft > 0U ) && ( shouldReceive == 1U ) )
     {
-        LogError( ( "Failed to receive HTTP data: Transport recv() "
-                    "returned error: TransportStatus=%ld",
-                    ( long int ) transportStatus ) );
-        returnStatus = HTTPNetworkError;
-    }
-    else if( transportStatus > 0 )
-    {
-        /* It is a bug in the application's transport receive implementation if
-         * more bytes than expected are received. To avoid a possible overflow
-         * in converting bytesRemaining from unsigned to signed, this assert
-         * must exist after the check for transportStatus being negative. */
-        assert( ( size_t ) transportStatus <= bufferLen );
+        transportStatus = pTransport->recv( pTransport->pNetworkContext,
+                                            pIndex,
+                                            bufferSpaceLeft );
 
-        /* Some or all of the specified data was received. */
-        *pBytesReceived = ( size_t ) ( transportStatus );
-        LogDebug( ( "Received data from the transport: BytesReceived=%ld",
-                    ( long int ) transportStatus ) );
-    }
-    else
-    {
-        /* When a zero is returned from the transport recv it will not be
-         * invoked again. */
-        *pBytesReceived = 0U;
-        LogDebug( ( "Received zero bytes from transport recv(). Receiving "
-                    "transport data is complete." ) );
+        /* A transport status of less than zero is an error. */
+        if( transportStatus < 0 )
+        {
+            LogError( ( "Failed to receive HTTP data: Transport recv() "
+                        "returned error: TransportStatus=%ld",
+                        ( long int ) transportStatus ) );
+            shouldReceive = 0;
+            returnStatus = HTTPNetworkError;
+        }
+        else if( transportStatus > 0 )
+        {
+            /* It is a bug in the application's transport receive implementation if
+             * more bytes than expected are received. To avoid a possible overflow
+             * in converting bytesRemaining from unsigned to signed, this assert
+             * must exist after the check for transportStatus being negative. */
+            assert( ( size_t ) transportStatus <= bufferSpaceLeft );
+
+            /* Reset the time of the last received data when data is received. */
+            lastDataRecvTimeMs = getTimestampMs();
+
+            /* Some or all of the specified data was received. */
+            *pBytesReceived += ( size_t ) ( transportStatus );
+            pIndex += ( size_t ) ( transportStatus );
+            bufferSpaceLeft -= ( size_t ) ( transportStatus );
+            LogDebug( ( "Received data from the transport: BytesReceived=%ld",
+                        ( long int ) transportStatus ) );
+        }
+        else
+        {
+            /* No bytes were read from the network. */
+            timeSinceLastRecvMs = getTimeStampMs() - lastDataRecvTimeMs;
+
+            /* Check of the allowed elapsed time has been reached. */
+            if( timeSinceLastRecvMs >= HTTP_RECV_RETRY_TIMEOUT_MS )
+            {
+                /* If the timeout has been reached it is not necessarily an error.
+                 * Since we don't know how large the packet is, we need to parse
+                 * what we have so far when this function returns. */
+                LogWarn( ( "Unable to receive response: Timed out in transport recv." ) );
+                shouldReceive = 0;
+            }
+        }
     }
 
     return returnStatus;
